@@ -45,6 +45,12 @@ static const enum AVPixelFormat supported_formats[] = {
     AV_PIX_FMT_NONE
 };
 
+static const enum AVPixelFormat supported_map_formats[] = {
+    AV_PIX_FMT_YUV444P16LE,
+    AV_PIX_FMT_GRAY16LE,
+    AV_PIX_FMT_NONE
+};
+
 typedef struct RemapNPPContext {
     const AVClass* class;
     
@@ -141,8 +147,8 @@ static int remap_npp(FFFrameSync *fs)
     
     cpy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
     cpy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-    cpy.srcDevice = input_bottom->data[0];
-    cpy.dstDevice = input_top->data[0];
+    cpy.srcDevice = (CUdeviceptr)input_bottom->data[0];
+    cpy.dstDevice = (CUdeviceptr)input_top->data[0];
     cpy.srcPitch = input_bottom->linesize[0];
     cpy.dstPitch = input_top->linesize[0];
     cpy.WidthInBytes = input_top->linesize[0];
@@ -156,8 +162,8 @@ static int remap_npp(FFFrameSync *fs)
     {
         case AV_PIX_FMT_YUV420P:
         {
-            cpy.srcDevice = input_bottom->data[1];
-            cpy.dstDevice = input_top->data[1];
+            cpy.srcDevice = (CUdeviceptr)input_bottom->data[1];
+            cpy.dstDevice = (CUdeviceptr)input_top->data[1];
             cpy.srcPitch = input_bottom->linesize[1];
             cpy.dstPitch = input_top->linesize[1];
             cpy.WidthInBytes = input_top->linesize[1];
@@ -167,8 +173,8 @@ static int remap_npp(FFFrameSync *fs)
             if (ret < 0)
                 return ret;
 
-            cpy.srcDevice = input_bottom->data[2];
-            cpy.dstDevice = input_top->data[2];
+            cpy.srcDevice = (CUdeviceptr)input_bottom->data[2];
+            cpy.dstDevice = (CUdeviceptr)input_top->data[2];
             cpy.srcPitch = input_bottom->linesize[2];
             cpy.dstPitch = input_top->linesize[2];
             cpy.WidthInBytes = input_top->linesize[2];
@@ -196,11 +202,9 @@ static int remap_npp(FFFrameSync *fs)
 
 static int remap_npp_init(AVFilterContext* avctx)
 {
+    RemapNPPContext* ctx = avctx->priv;
     av_log(avctx, AV_LOG_DEBUG, "remap_npp_init\n");
 
-    RemapNPPContext* ctx = avctx->priv;
-    ctx->fs.on_event = &remap_npp;
-    
     ctx->vstack_frame = av_frame_alloc();
     if (!ctx->vstack_frame)
         return AVERROR(ENOMEM);
@@ -210,9 +214,9 @@ static int remap_npp_init(AVFilterContext* avctx)
 
 static void remap_npp_uninit(AVFilterContext* avctx)
 {
+    RemapNPPContext* ctx = avctx->priv;
     av_log(avctx, AV_LOG_DEBUG, "remap_npp_uninit\n");
 
-    RemapNPPContext* ctx = avctx->priv;
     ff_framesync_uninit(&ctx->fs);
     
     av_buffer_unref(&ctx->frames_ctx);
@@ -256,6 +260,35 @@ static int config_props(AVFilterLink *inlink)
     if (ctx->inputs[0] != inlink)
         return 0;
 
+    return 0;
+}
+
+static int config_map(AVFilterLink *inlink)
+{
+    AVHWFramesContext *input_frames;
+    AVFilterContext *ctx = inlink->dst;
+
+    av_log(ctx, AV_LOG_INFO, "config_map\n");
+    
+    if (!inlink->hw_frames_ctx) {
+        av_log(ctx, AV_LOG_ERROR, "remap_npptering requires a "
+               "hardware frames context on the input.\n");
+        return AVERROR(EINVAL);
+    }
+
+    if (!inlink->hw_frames_ctx) {
+        av_log(ctx, AV_LOG_ERROR, "NPP filtering requires a "
+               "hardware frames context on the input.\n");
+        return AVERROR(EINVAL);
+    }
+
+    input_frames = (AVHWFramesContext *)inlink->hw_frames_ctx->data;
+    if (input_frames->format != AV_PIX_FMT_CUDA)
+    {
+        av_log(ctx, AV_LOG_ERROR, "Input map is not CUDA.\n");
+        return AVERROR(EINVAL);
+    }
+    
     return 0;
 }
 
@@ -323,19 +356,31 @@ static int config_output(AVFilterLink* outlink)
     AVFilterContext* ctx = outlink->src;
     AVHWFramesContext *out_ctx, *in_ctx;
     RemapNPPContext* s = ctx->priv;
-    
+    AVFilterLink *inlink_top = ctx->inputs[0];
+    AVFilterLink *inlink_bot = ctx->inputs[1];
+    AVFilterLink *inlink_xmap = ctx->inputs[2];
+    AVFilterLink *inlink_ymap = ctx->inputs[3];
+    AVHWFramesContext *frames_ctx_top, *frames_ctx_bot, *frames_ctx_xmap, *frames_ctx_ymap;
+    FFFrameSyncIn *in;
+
     av_log(ctx, AV_LOG_DEBUG, "config_output\n");
     
-    AVFilterLink *inlink_top = ctx->inputs[0];
     if (!inlink_top || !inlink_top->hw_frames_ctx || !inlink_top->hw_frames_ctx->data)
         return AVERROR(EINVAL);
-    AVHWFramesContext  *frames_ctx_top = (AVHWFramesContext*)inlink_top->hw_frames_ctx->data;
+    frames_ctx_top = (AVHWFramesContext*)inlink_top->hw_frames_ctx->data;
     
-    AVFilterLink *inlink_bot = ctx->inputs[1];
     if (!inlink_bot || !inlink_bot->hw_frames_ctx || !inlink_bot->hw_frames_ctx->data)
         return AVERROR(EINVAL);
-    AVHWFramesContext  *frames_ctx_bot = (AVHWFramesContext*)inlink_bot->hw_frames_ctx->data;
+    frames_ctx_bot = (AVHWFramesContext*)inlink_bot->hw_frames_ctx->data;
     
+    if (!inlink_xmap || !inlink_xmap->hw_frames_ctx || !inlink_xmap->hw_frames_ctx->data)
+        return AVERROR(EINVAL);
+    frames_ctx_xmap = (AVHWFramesContext*)inlink_xmap->hw_frames_ctx->data;
+
+    if (!inlink_ymap || !inlink_ymap->hw_frames_ctx || !inlink_ymap->hw_frames_ctx->data)
+        return AVERROR(EINVAL);
+    frames_ctx_ymap = (AVHWFramesContext*)inlink_ymap->hw_frames_ctx->data;
+
     // check top input formats
     
     if (!frames_ctx_top) {
@@ -364,6 +409,37 @@ static int config_output(AVFilterLink* outlink)
         return AVERROR(ENOSYS);
     }
     
+    // check xmap/ymap
+
+    if (!frames_ctx_xmap) {
+        av_log(ctx, AV_LOG_ERROR, "No hw context provided on xmap input\n");
+        return AVERROR(EINVAL);
+    }
+    if (!format_is_supported(supported_map_formats, frames_ctx_xmap->sw_format)) {
+        av_log(ctx, AV_LOG_ERROR, "Unsupported xmap input format: %s\n",
+               av_get_pix_fmt_name(frames_ctx_xmap->sw_format));
+        return AVERROR(ENOSYS);
+    }
+
+    if (!frames_ctx_ymap) {
+        av_log(ctx, AV_LOG_ERROR, "No hw context provided on ymap input\n");
+        return AVERROR(EINVAL);
+    }
+    if (!format_is_supported(supported_map_formats, frames_ctx_xmap->sw_format)) {
+        av_log(ctx, AV_LOG_ERROR, "Unsupported ymap input format: %s\n",
+               av_get_pix_fmt_name(frames_ctx_ymap->sw_format));
+        return AVERROR(ENOSYS);
+    }
+
+    if (inlink_xmap->w != inlink_ymap->w || inlink_xmap->h != inlink_ymap->h) {
+        av_log(ctx, AV_LOG_ERROR, "Third input link %s parameters "
+               "(size %dx%d) do not match the corresponding "
+               "fourth input link %s parameters (%dx%d)\n",
+               ctx->input_pads[2].name, inlink_xmap->w, inlink_xmap->h,
+               ctx->input_pads[3].name, inlink_ymap->w, inlink_ymap->h);
+        return AVERROR(EINVAL);
+    }
+
     // check we can vstack pictures with those pixel formats
     
     if (s->in_format_top != s->in_format_bottom) {
@@ -405,14 +481,34 @@ static int config_output(AVFilterLink* outlink)
 
     // TODO: load/convert xmap/ymap
     
-    // init dual input
+    // init quad input
     
-    ret = ff_framesync_init_dualinput(&s->fs, ctx);
+    ret = ff_framesync_init(&s->fs, ctx, 4);
     if (ret < 0) {
         av_buffer_unref(&s->frames_ctx);
         return ret;
     }
     
+    in = s->fs.in;
+    in[0].time_base = inlink_top->time_base;
+    in[1].time_base = inlink_bot->time_base;
+    in[2].time_base = inlink_xmap->time_base;
+    in[3].time_base = inlink_ymap->time_base;
+    in[0].sync   = 2;
+    in[0].before = EXT_STOP;
+    in[0].after  = EXT_STOP;
+    in[1].sync   = 2;
+    in[1].before = EXT_STOP;
+    in[1].after  = EXT_STOP;
+    in[2].sync   = 1;
+    in[2].before = EXT_NULL;
+    in[2].after  = EXT_INFINITY;
+    in[3].sync   = 1;
+    in[3].before = EXT_NULL;
+    in[3].after  = EXT_INFINITY;
+    s->fs.opaque   = s;
+    s->fs.on_event = &remap_npp;
+
     ret = ff_framesync_configure(&s->fs);
     if (ret < 0) {
         av_buffer_unref(&s->frames_ctx);
@@ -445,7 +541,6 @@ static int remap_npp_config_props(AVFilterLink* outlink)
 
     return 0;
 }
-#endif
 
 static int nppsharpen_sharpen(AVFilterContext* ctx, AVFrame* out, AVFrame* in)
 {
@@ -470,6 +565,7 @@ static int nppsharpen_sharpen(AVFilterContext* ctx, AVFrame* out, AVFrame* in)
 
     return 0;
 }
+#endif
 
 #if 0
 static int remap_npp_filter_frame(AVFilterLink* link, AVFrame* in)
@@ -539,16 +635,16 @@ static const AVFilterPad remap_npp_inputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = config_props,
     },
-#if 0
     {
         .name         = "xmap",
         .type         = AVMEDIA_TYPE_VIDEO,
+        .config_props = config_map,
     },
     {
         .name         = "ymap",
         .type         = AVMEDIA_TYPE_VIDEO,
+        .config_props = config_map,
     },
-#endif
 };
 
 static const AVFilterPad remap_npp_outputs[] = {
