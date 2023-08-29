@@ -24,14 +24,11 @@
 #include "libavutil/cuda_check.h"
 #include "libavutil/internal.h"
 #include "libavutil/opt.h"
-#include "libavutil/parseutils.h"
-#include "libavutil/eval.h"
 #include "libavutil/colorspace.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/opt.h"
 
 #include "avfilter.h"
-#include "drawutils.h"
 #include "filters.h"
 #include "framesync.h"
 #include "internal.h"
@@ -39,10 +36,15 @@
 
 #include "cuda/load_helper.h"
 
+#define DIV_UP(a, b) ( ((a) + (b) - 1) / (b) )
+
+#define BLOCK_X 32
+#define BLOCK_Y 16
+
 #define CHECK_CU(x) FF_CUDA_CHECK_DL(avctx, ctx->hwctx->internal->cuda_dl, x)
 
 static const enum AVPixelFormat supported_formats[] = {
-    AV_PIX_FMT_NV12,
+    AV_PIX_FMT_YUV444P,
     AV_PIX_FMT_NONE
 };
 
@@ -84,9 +86,45 @@ static int format_is_supported(const enum AVPixelFormat formats[], enum AVPixelF
     return 0;
 }
 
+/**
+ * Call remap kernell for a plane
+ */
+static int remap_cuda_call_kernel(
+    AVFilterContext *avctx,
+    uint8_t* top_data, int top_linesize,
+    uint8_t* bottom_data, int bottom_linesize,
+    int top_width, int top_height,
+    uint16_t* xmap_data, int xmap_linesize,
+    uint16_t* ymap_data, int ymap_linesize,
+    int xmap_width, int xmap_height,
+    uint8_t fill_color,
+    uint8_t* output, int output_linesize)
+{
+    RemapCUDAContext *ctx = avctx->priv;
+    CudaFunctions *cu = ctx->hwctx->internal->cuda_dl;
+
+    void* kernel_args[] = {
+        &top_data, &top_linesize,
+        &bottom_data, &bottom_linesize,
+        &top_width, &top_height,
+        &xmap_data, &xmap_linesize,
+        &ymap_data, &ymap_linesize,
+        &xmap_width, &xmap_height,
+        &fill_color,
+        &output, &output_linesize
+    };
+
+    return CHECK_CU(cu->cuLaunchKernel(
+        ctx->cu_func,
+        DIV_UP(xmap_width, BLOCK_X), DIV_UP(xmap_height, BLOCK_Y), 1,
+        BLOCK_X, BLOCK_Y, 1,
+        0, ctx->cu_stream, kernel_args, NULL));
+}
+
+
 static int remap_cuda(FFFrameSync *fs)
 {
-    int ret;
+    int i, ret;
     
     AVFilterContext *avctx = fs->parent;
     RemapCUDAContext *ctx = avctx->priv;
@@ -95,7 +133,11 @@ static int remap_cuda(FFFrameSync *fs)
     AVFrame *input_top, *input_bottom, *input_xmap, *input_ymap;
     AVFrame *output;
     CUcontext dummy;
-    CUDA_MEMCPY2D cpy = { 0 };
+    unsigned char black[3] = {
+        RGB_TO_Y_BT709(0, 0, 0),
+        RGB_TO_U_BT709(0, 0, 0, 0),
+        RGB_TO_V_BT709(0, 0, 0, 0)
+    };
     
     av_log(avctx, AV_LOG_DEBUG, "remap_cuda: %d %d\n", outlink->w, outlink->h);
 
@@ -137,31 +179,19 @@ static int remap_cuda(FFFrameSync *fs)
         return ret;
     
     // Do the processing
-    cpy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-    cpy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-    cpy.srcDevice = (CUdeviceptr)input_top->data[0]+300;
-    cpy.dstDevice = (CUdeviceptr)output->data[0];
-    cpy.srcPitch = input_top->linesize[0];
-    cpy.dstPitch = output->linesize[0];
-    cpy.WidthInBytes = output->linesize[0];
-    cpy.Height = output->height;
-
-    ret = CHECK_CU(cu->cuMemcpy2DAsync(&cpy, ctx->cu_stream));
-    if (ret < 0)
-        return ret;
-
-    cpy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-    cpy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-    cpy.srcDevice = (CUdeviceptr)input_top->data[1]+300;
-    cpy.dstDevice = (CUdeviceptr)output->data[1];
-    cpy.srcPitch = input_top->linesize[1];
-    cpy.dstPitch = output->linesize[1];
-    cpy.WidthInBytes = output->linesize[1];
-    cpy.Height = output->height/2;
-
-    ret = CHECK_CU(cu->cuMemcpy2DAsync(&cpy, ctx->cu_stream));
-    if (ret < 0)
-        return ret;
+    for (i = 0; i < 3; i++)
+    {
+        remap_cuda_call_kernel(avctx,
+                               input_top->data[i], input_top->linesize[i],
+                               input_bottom->data[i], input_bottom->linesize[i],
+                               input_top->width, input_top->height,
+                               (uint16_t*)input_xmap->data[0], input_xmap->linesize[0],
+                               (uint16_t*)input_ymap->data[0], input_ymap->linesize[0],
+                               input_xmap->width, input_xmap->height,
+                               black[i],
+                               output->data[i], output->linesize[i]
+                               );
+    }
 
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     if (ret < 0)
