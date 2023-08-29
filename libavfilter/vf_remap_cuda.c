@@ -16,7 +16,6 @@
  * Target_frame[y][x] = Source_frame[ ymap[y][x] ][ [xmap[y][x] ];
  */
 
-#include <nppi.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -38,6 +37,8 @@
 #include "internal.h"
 #include "video.h"
 
+#include "cuda/load_helper.h"
+
 #define CHECK_CU(x) FF_CUDA_CHECK_DL(avctx, ctx->hwctx->internal->cuda_dl, x)
 
 static const enum AVPixelFormat supported_formats[] = {
@@ -51,45 +52,32 @@ static const enum AVPixelFormat supported_map_formats[] = {
     AV_PIX_FMT_NONE
 };
 
-typedef struct RemapNPPContext {
+typedef struct RemapCUDAContext {
     const AVClass* class;
     
     enum AVPixelFormat in_format_top;
     enum AVPixelFormat in_format_bottom;
     
     AVCUDADeviceContext *hwctx;
+
+    CUmodule    cu_module;
+    CUfunction  cu_func;
     CUstream    cu_stream;
     
     AVBufferRef* frames_ctx;
     AVFrame* vstack_frame;
 
-    NppiBorderType border_type;
-    int interp_algo;
-    
     FFFrameSync fs;
-} RemapNPPContext;
+} RemapCUDAContext;
 
-#define OFFSET(x) offsetof(RemapNPPContext, x)
+#define OFFSET(x) offsetof(RemapCUDAContext, x)
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
 
-static const AVOption remap_npp_options[] = {
-    { "interp_algo", "Interpolation algorithm used for resizing", OFFSET(interp_algo), AV_OPT_TYPE_INT, { .i64 = NPPI_INTER_CUBIC }, 0, INT_MAX, FLAGS, "interp_algo" },
-        { "nn",                 "nearest neighbour",                 0, AV_OPT_TYPE_CONST, { .i64 = NPPI_INTER_NN                 }, 0, 0, FLAGS, "interp_algo" },
-        { "linear",             "linear",                            0, AV_OPT_TYPE_CONST, { .i64 = NPPI_INTER_LINEAR             }, 0, 0, FLAGS, "interp_algo" },
-        { "cubic",              "cubic",                             0, AV_OPT_TYPE_CONST, { .i64 = NPPI_INTER_CUBIC              }, 0, 0, FLAGS, "interp_algo" },
-        { "cubic2p_bspline",    "2-parameter cubic (B=1, C=0)",      0, AV_OPT_TYPE_CONST, { .i64 = NPPI_INTER_CUBIC2P_BSPLINE    }, 0, 0, FLAGS, "interp_algo" },
-        { "cubic2p_catmullrom", "2-parameter cubic (B=0, C=1/2)",    0, AV_OPT_TYPE_CONST, { .i64 = NPPI_INTER_CUBIC2P_CATMULLROM }, 0, 0, FLAGS, "interp_algo" },
-        { "cubic2p_b05c03",     "2-parameter cubic (B=1/2, C=3/10)", 0, AV_OPT_TYPE_CONST, { .i64 = NPPI_INTER_CUBIC2P_B05C03     }, 0, 0, FLAGS, "interp_algo" },
-        { "super",              "supersampling",                     0, AV_OPT_TYPE_CONST, { .i64 = NPPI_INTER_SUPER              }, 0, 0, FLAGS, "interp_algo" },
-        { "lanczos",            "Lanczos",                           0, AV_OPT_TYPE_CONST, { .i64 = NPPI_INTER_LANCZOS            }, 0, 0, FLAGS, "interp_algo" },
-
-    { "border_type", "Type of operation to be performed on image border", OFFSET(border_type), AV_OPT_TYPE_INT, { .i64 = NPP_BORDER_REPLICATE }, NPP_BORDER_REPLICATE, NPP_BORDER_REPLICATE, FLAGS, "border_type" },
-        { "replicate", "replicate pixels", 0, AV_OPT_TYPE_CONST, { .i64 = NPP_BORDER_REPLICATE }, 0, 0, FLAGS, "border_type" },
+static const AVOption remap_cuda_options[] = {
     { NULL }
-    
 };
 
-FRAMESYNC_DEFINE_CLASS(remap_npp, RemapNPPContext, fs);
+FRAMESYNC_DEFINE_CLASS(remap_cuda, RemapCUDAContext, fs);
 
 static int format_is_supported(const enum AVPixelFormat formats[], enum AVPixelFormat fmt)
 {
@@ -99,12 +87,12 @@ static int format_is_supported(const enum AVPixelFormat formats[], enum AVPixelF
     return 0;
 }
 
-static int remap_npp(FFFrameSync *fs)
+static int remap_cuda(FFFrameSync *fs)
 {
     int ret;
     
     AVFilterContext *avctx = fs->parent;
-    RemapNPPContext *ctx = avctx->priv;
+    RemapCUDAContext *ctx = avctx->priv;
     CudaFunctions *cu = ctx->hwctx->internal->cuda_dl;
     AVFilterLink *outlink = avctx->outputs[0];
     AVFilterLink *inlink = avctx->inputs[0];
@@ -200,10 +188,10 @@ static int remap_npp(FFFrameSync *fs)
     return ff_filter_frame(outlink, input_top);
 }
 
-static int remap_npp_init(AVFilterContext* avctx)
+static int remap_cuda_init(AVFilterContext* avctx)
 {
-    RemapNPPContext* ctx = avctx->priv;
-    av_log(avctx, AV_LOG_DEBUG, "remap_npp_init\n");
+    RemapCUDAContext* ctx = avctx->priv;
+    av_log(avctx, AV_LOG_DEBUG, "remap_cuda_init\n");
 
     ctx->vstack_frame = av_frame_alloc();
     if (!ctx->vstack_frame)
@@ -212,20 +200,31 @@ static int remap_npp_init(AVFilterContext* avctx)
     return 0;
 }
 
-static void remap_npp_uninit(AVFilterContext* avctx)
+static void remap_cuda_uninit(AVFilterContext* avctx)
 {
-    RemapNPPContext* ctx = avctx->priv;
-    av_log(avctx, AV_LOG_DEBUG, "remap_npp_uninit\n");
+    RemapCUDAContext* ctx = avctx->priv;
+    av_log(avctx, AV_LOG_DEBUG, "remap_cuda_uninit\n");
 
     ff_framesync_uninit(&ctx->fs);
     
+    if (ctx->hwctx && ctx->cu_module) {
+        CudaFunctions *cu = ctx->hwctx->internal->cuda_dl;
+        CUcontext dummy;
+
+        CHECK_CU(cu->cuCtxPushCurrent(ctx->hwctx->cuda_ctx));
+        CHECK_CU(cu->cuModuleUnload(ctx->cu_module));
+        ctx->cu_module = NULL;
+        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+    }
+
     av_buffer_unref(&ctx->frames_ctx);
     av_frame_free(&ctx->vstack_frame);
 }
 
-static int remap_npp_activate(AVFilterContext *avctx)
+static int remap_cuda_activate(AVFilterContext *avctx)
 {
-    RemapNPPContext *ctx = avctx->priv;
+    RemapCUDAContext *ctx = avctx->priv;
+    av_log(ctx, AV_LOG_DEBUG, "remap_cuda_activate\n");
 
     return ff_framesync_activate(&ctx->fs);
 }
@@ -234,14 +233,14 @@ static int config_props(AVFilterLink *inlink)
 {
     AVHWFramesContext *input_frames;
     AVFilterContext *ctx = inlink->dst;
-    RemapNPPContext *s = ctx->priv;
+    RemapCUDAContext *s = ctx->priv;
     AVHWFramesContext     *hw_frames_ctx = (AVHWFramesContext*)inlink->hw_frames_ctx->data;
     AVCUDADeviceContext *device_hwctx = hw_frames_ctx->device_ctx->hwctx;
 
     av_log(ctx, AV_LOG_DEBUG, "config_props\n");
-    
+
     if (!inlink->hw_frames_ctx) {
-        av_log(ctx, AV_LOG_ERROR, "NPP filtering requires a "
+        av_log(ctx, AV_LOG_ERROR, "CUDA filtering requires a "
                "hardware frames context on the input.\n");
         return AVERROR(EINVAL);
     }
@@ -268,16 +267,16 @@ static int config_map(AVFilterLink *inlink)
     AVHWFramesContext *input_frames;
     AVFilterContext *ctx = inlink->dst;
 
-    av_log(ctx, AV_LOG_INFO, "config_map\n");
+    av_log(ctx, AV_LOG_DEBUG, "config_map\n");
     
     if (!inlink->hw_frames_ctx) {
-        av_log(ctx, AV_LOG_ERROR, "remap_npptering requires a "
+        av_log(ctx, AV_LOG_ERROR, "remap_cuda requires a "
                "hardware frames context on the input.\n");
         return AVERROR(EINVAL);
     }
 
     if (!inlink->hw_frames_ctx) {
-        av_log(ctx, AV_LOG_ERROR, "NPP filtering requires a "
+        av_log(ctx, AV_LOG_ERROR, "CUDA filtering requires a "
                "hardware frames context on the input.\n");
         return AVERROR(EINVAL);
     }
@@ -292,78 +291,26 @@ static int config_map(AVFilterLink *inlink)
     return 0;
 }
 
-#if 0
-static int remap_npp_config(AVFilterContext* ctx, int width, int height)
-{
-    av_log(ctx, AV_LOG_DEBUG, "remap_npp_config\n");
-
-    RemapNPPContext* s = ctx->priv;
-    AVHWFramesContext *out_ctx, *in_ctx;
-    int i, ret, supported_format = 0;
-
-    if (!ctx->inputs[0]->hw_frames_ctx) {
-        av_log(ctx, AV_LOG_ERROR, "No hw context provided on input\n");
-        goto fail;
-    }
-
-    in_ctx = (AVHWFramesContext*)ctx->inputs[0]->hw_frames_ctx->data;
-
-    s->frames_ctx = av_hwframe_ctx_alloc(in_ctx->device_ref);
-    if (!s->frames_ctx)
-        goto fail;
-
-    out_ctx = (AVHWFramesContext*)s->frames_ctx->data;
-    out_ctx->format = AV_PIX_FMT_CUDA;
-    out_ctx->sw_format = in_ctx->sw_format;
-    out_ctx->width = FFALIGN(width, 32);
-    out_ctx->height = FFALIGN(height, 32);
-
-    for (i = 0; i < FF_ARRAY_ELEMS(supported_formats); i++) {
-        if (in_ctx->sw_format == supported_formats[i]) {
-            supported_format = 1;
-            break;
-        }
-    }
-
-    if (!supported_format) {
-        av_log(ctx, AV_LOG_ERROR, "Unsupported pixel format: %s\n", av_get_pix_fmt_name(in_ctx->sw_format));
-        goto fail;
-    }
-
-    ret = av_hwframe_ctx_init(s->frames_ctx);
-    if (ret < 0)
-        goto fail;
-
-    ret = av_hwframe_get_buffer(s->frames_ctx, s->own_frame, 0);
-    if (ret < 0)
-        goto fail;
-
-    ctx->outputs[0]->hw_frames_ctx = av_buffer_ref(s->frames_ctx);
-    if (!ctx->outputs[0]->hw_frames_ctx)
-        goto fail;
-
-    return 0;
-
-fail:
-    av_buffer_unref(&s->frames_ctx);
-    return AVERROR(ENOMEM);
-}
-#endif
-
 static int config_output(AVFilterLink* outlink)
 {
+    extern const unsigned char ff_vf_remap_cuda_ptx_data[];
+    extern const unsigned int ff_vf_remap_cuda_ptx_len;
+
     int ret;
-    AVFilterContext* ctx = outlink->src;
+    AVFilterContext* avctx = outlink->src;
     AVHWFramesContext *out_ctx, *in_ctx;
-    RemapNPPContext* s = ctx->priv;
-    AVFilterLink *inlink_top = ctx->inputs[0];
-    AVFilterLink *inlink_bot = ctx->inputs[1];
-    AVFilterLink *inlink_xmap = ctx->inputs[2];
-    AVFilterLink *inlink_ymap = ctx->inputs[3];
+    RemapCUDAContext* ctx = avctx->priv;
+    AVFilterLink *inlink_top = avctx->inputs[0];
+    AVFilterLink *inlink_bot = avctx->inputs[1];
+    AVFilterLink *inlink_xmap = avctx->inputs[2];
+    AVFilterLink *inlink_ymap = avctx->inputs[3];
     AVHWFramesContext *frames_ctx_top, *frames_ctx_bot, *frames_ctx_xmap, *frames_ctx_ymap;
     FFFrameSyncIn *in;
 
-    av_log(ctx, AV_LOG_DEBUG, "config_output\n");
+    CUcontext dummy;
+    CudaFunctions *cu;
+
+    av_log(avctx, AV_LOG_DEBUG, "config_output\n");
     
     if (!inlink_top || !inlink_top->hw_frames_ctx || !inlink_top->hw_frames_ctx->data)
         return AVERROR(EINVAL);
@@ -388,108 +335,129 @@ static int config_output(AVFilterLink* outlink)
         return AVERROR(EINVAL);
     }
     
-    s->in_format_top = frames_ctx_top->sw_format;
-    if (!format_is_supported(supported_formats, s->in_format_top)) {
-        av_log(ctx, AV_LOG_ERROR, "Unsupported top input format: %s\n",
-               av_get_pix_fmt_name(s->in_format_top));
+    ctx->in_format_top = frames_ctx_top->sw_format;
+    if (!format_is_supported(supported_formats, ctx->in_format_top)) {
+        av_log(avctx, AV_LOG_ERROR, "Unsupported top input format: %s\n",
+               av_get_pix_fmt_name(ctx->in_format_top));
         return AVERROR(ENOSYS);
     }
     
     // check bottom input formats
     
     if (!frames_ctx_bot) {
-        av_log(ctx, AV_LOG_ERROR, "No hw context provided on bottom input\n");
+        av_log(avctx, AV_LOG_ERROR, "No hw context provided on bottom input\n");
         return AVERROR(EINVAL);
     }
     
-    s->in_format_bottom = frames_ctx_bot->sw_format;
-    if (!format_is_supported(supported_formats, s->in_format_bottom)) {
-        av_log(ctx, AV_LOG_ERROR, "Unsupported bottom input format: %s\n",
-               av_get_pix_fmt_name(s->in_format_bottom));
+    ctx->in_format_bottom = frames_ctx_bot->sw_format;
+    if (!format_is_supported(supported_formats, ctx->in_format_bottom)) {
+        av_log(avctx, AV_LOG_ERROR, "Unsupported bottom input format: %s\n",
+               av_get_pix_fmt_name(ctx->in_format_bottom));
         return AVERROR(ENOSYS);
     }
     
     // check xmap/ymap
 
     if (!frames_ctx_xmap) {
-        av_log(ctx, AV_LOG_ERROR, "No hw context provided on xmap input\n");
+        av_log(avctx, AV_LOG_ERROR, "No hw context provided on xmap input\n");
         return AVERROR(EINVAL);
     }
     if (!format_is_supported(supported_map_formats, frames_ctx_xmap->sw_format)) {
-        av_log(ctx, AV_LOG_ERROR, "Unsupported xmap input format: %s\n",
+        av_log(avctx, AV_LOG_ERROR, "Unsupported xmap input format: %s\n",
                av_get_pix_fmt_name(frames_ctx_xmap->sw_format));
         return AVERROR(ENOSYS);
     }
 
     if (!frames_ctx_ymap) {
-        av_log(ctx, AV_LOG_ERROR, "No hw context provided on ymap input\n");
+        av_log(avctx, AV_LOG_ERROR, "No hw context provided on ymap input\n");
         return AVERROR(EINVAL);
     }
     if (!format_is_supported(supported_map_formats, frames_ctx_xmap->sw_format)) {
-        av_log(ctx, AV_LOG_ERROR, "Unsupported ymap input format: %s\n",
+        av_log(avctx, AV_LOG_ERROR, "Unsupported ymap input format: %s\n",
                av_get_pix_fmt_name(frames_ctx_ymap->sw_format));
         return AVERROR(ENOSYS);
     }
 
     if (inlink_xmap->w != inlink_ymap->w || inlink_xmap->h != inlink_ymap->h) {
-        av_log(ctx, AV_LOG_ERROR, "Third input link %s parameters "
+        av_log(avctx, AV_LOG_ERROR, "Third input link %s parameters "
                "(size %dx%d) do not match the corresponding "
                "fourth input link %s parameters (%dx%d)\n",
-               ctx->input_pads[2].name, inlink_xmap->w, inlink_xmap->h,
-               ctx->input_pads[3].name, inlink_ymap->w, inlink_ymap->h);
+               avctx->input_pads[2].name, inlink_xmap->w, inlink_xmap->h,
+               avctx->input_pads[3].name, inlink_ymap->w, inlink_ymap->h);
         return AVERROR(EINVAL);
     }
 
     // check we can vstack pictures with those pixel formats
     
-    if (s->in_format_top != s->in_format_bottom) {
-        av_log(ctx, AV_LOG_ERROR, "Can't vstack %s on %s \n",
-               av_get_pix_fmt_name(s->in_format_top), av_get_pix_fmt_name(s->in_format_bottom));
+    if (ctx->in_format_top != ctx->in_format_bottom) {
+        av_log(avctx, AV_LOG_ERROR, "Can't vstack %s on %s \n",
+               av_get_pix_fmt_name(ctx->in_format_top), av_get_pix_fmt_name(ctx->in_format_bottom));
         return AVERROR(EINVAL);
     }
     
     // Allocate vstack image
-    in_ctx = (AVHWFramesContext*)ctx->inputs[0]->hw_frames_ctx->data;
+    in_ctx = (AVHWFramesContext*)avctx->inputs[0]->hw_frames_ctx->data;
 
-    av_log(ctx, AV_LOG_DEBUG, "config_output: av_hwframe_ctx_alloc\n");
-    s->frames_ctx = av_hwframe_ctx_alloc(in_ctx->device_ref);
-    if (!s->frames_ctx)
+    av_log(avctx, AV_LOG_DEBUG, "config_output: av_hwframe_ctx_alloc\n");
+    ctx->frames_ctx = av_hwframe_ctx_alloc(in_ctx->device_ref);
+    if (!ctx->frames_ctx)
         goto fail;
 
-    out_ctx = (AVHWFramesContext*)s->frames_ctx->data;
+    out_ctx = (AVHWFramesContext*)ctx->frames_ctx->data;
     out_ctx->format = AV_PIX_FMT_CUDA;
     out_ctx->sw_format = in_ctx->sw_format;
     out_ctx->width = FFALIGN(inlink_top->w, 32);
     out_ctx->height = FFALIGN(inlink_top->h+inlink_bot->h, 32);
     
-    av_log(ctx, AV_LOG_DEBUG, "config_output: av_hwframe_ctx_init\n");
-    ret = av_hwframe_ctx_init(s->frames_ctx);
+    av_log(avctx, AV_LOG_DEBUG, "config_output: av_hwframe_ctx_init\n");
+    ret = av_hwframe_ctx_init(ctx->frames_ctx);
     if (ret < 0)
         goto fail;
 
-    av_log(ctx, AV_LOG_DEBUG, "config_output: av_hwframe_get_buffer\n");
-    av_frame_unref(s->vstack_frame);
-    ret = av_hwframe_get_buffer(s->frames_ctx, s->vstack_frame, 0);
+    av_log(avctx, AV_LOG_DEBUG, "config_output: av_hwframe_get_buffer\n");
+    av_frame_unref(ctx->vstack_frame);
+    ret = av_hwframe_get_buffer(ctx->frames_ctx, ctx->vstack_frame, 0);
     if (ret < 0)
         goto fail;
 
     // TODO: for the moment vstack is our output buffer
-    av_log(ctx, AV_LOG_DEBUG, "config_output: av_buffer_ref\n");
-    ctx->outputs[0]->hw_frames_ctx = av_buffer_ref(s->frames_ctx);
-    if (!ctx->outputs[0]->hw_frames_ctx)
+    av_log(avctx, AV_LOG_DEBUG, "config_output: av_buffer_ref\n");
+    avctx->outputs[0]->hw_frames_ctx = av_buffer_ref(ctx->frames_ctx);
+    if (!avctx->outputs[0]->hw_frames_ctx)
         goto fail;
 
-    // TODO: load/convert xmap/ymap
+    // load functions
+
+    cu = ctx->hwctx->internal->cuda_dl;
+
+    ret = CHECK_CU(cu->cuCtxPushCurrent(ctx->hwctx->cuda_ctx));
+    if (ret < 0)
+        goto fail;
+
+    ret = ff_cuda_load_module(avctx, ctx->hwctx, &ctx->cu_module,
+                              ff_vf_remap_cuda_ptx_data, ff_vf_remap_cuda_ptx_len);
+    if (ret < 0) {
+        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+        return ret;
+    }
+
+    ret = CHECK_CU(cu->cuModuleGetFunction(&ctx->cu_func, ctx->cu_module, "Remap_Cuda"));
+    if (ret < 0) {
+        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+        return ret;
+    }
+
+    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     
     // init quad input
     
-    ret = ff_framesync_init(&s->fs, ctx, 4);
+    ret = ff_framesync_init(&ctx->fs, avctx, 4);
     if (ret < 0) {
-        av_buffer_unref(&s->frames_ctx);
+        av_buffer_unref(&ctx->frames_ctx);
         return ret;
     }
     
-    in = s->fs.in;
+    in = ctx->fs.in;
     in[0].time_base = inlink_top->time_base;
     in[1].time_base = inlink_bot->time_base;
     in[2].time_base = inlink_xmap->time_base;
@@ -506,126 +474,23 @@ static int config_output(AVFilterLink* outlink)
     in[3].sync   = 1;
     in[3].before = EXT_NULL;
     in[3].after  = EXT_INFINITY;
-    s->fs.opaque   = s;
-    s->fs.on_event = &remap_npp;
+    ctx->fs.opaque   = ctx;
+    ctx->fs.on_event = &remap_cuda;
 
-    ret = ff_framesync_configure(&s->fs);
+    ret = ff_framesync_configure(&ctx->fs);
     if (ret < 0) {
-        av_buffer_unref(&s->frames_ctx);
+        av_buffer_unref(&ctx->frames_ctx);
         return ret;
     }
     
     return 0;
 
 fail:
-    av_buffer_unref(&s->frames_ctx);
+    av_buffer_unref(&ctx->frames_ctx);
     return AVERROR(ENOMEM);
 }
 
-#if 0
-static int remap_npp_config_props(AVFilterLink* outlink)
-{
-    AVFilterLink* inlink = outlink->src->inputs[0];
-
-    outlink->w = inlink->w;
-    outlink->h = inlink->h;
-
-    if (inlink->sample_aspect_ratio.num)
-        outlink->sample_aspect_ratio = av_mul_q(
-            (AVRational){outlink->h * inlink->w, outlink->w * inlink->h},
-            inlink->sample_aspect_ratio);
-    else
-        outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
-
-    remap_npp_config(outlink->src, inlink->w, inlink->h);
-
-    return 0;
-}
-
-static int nppsharpen_sharpen(AVFilterContext* ctx, AVFrame* out, AVFrame* in)
-{
-    AVHWFramesContext* in_ctx =
-        (AVHWFramesContext*)ctx->inputs[0]->hw_frames_ctx->data;
-    RemapNPPContext* s = ctx->priv;
-
-    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(in_ctx->sw_format);
-
-    for (int i = 0; i < FF_ARRAY_ELEMS(in->data) && in->data[i]; i++) {
-        int ow = AV_CEIL_RSHIFT(in->width, (i == 1 || i == 2) ? desc->log2_chroma_w : 0);
-        int oh = AV_CEIL_RSHIFT(in->height, (i == 1 || i == 2) ? desc->log2_chroma_h : 0);
-
-        NppStatus err = nppiFilterSharpenBorder_8u_C1R(
-            in->data[i], in->linesize[i], (NppiSize){ow, oh}, (NppiPoint){0, 0},
-            out->data[i], out->linesize[i], (NppiSize){ow, oh}, s->border_type);
-        if (err != NPP_SUCCESS) {
-            av_log(ctx, AV_LOG_ERROR, "NPP sharpen error: %d\n", err);
-            return AVERROR_EXTERNAL;
-        }
-    }
-
-    return 0;
-}
-#endif
-
-#if 0
-static int remap_npp_filter_frame(AVFilterLink* link, AVFrame* in)
-{
-    AVFilterContext* ctx = link->dst;
-    RemapNPPContext* s = ctx->priv;
-    AVFilterLink* outlink = ctx->outputs[0];
-    if (!outlink || !outlink->hw_frames_ctx || !outlink->hw_frames_ctx->data)
-        return AVERROR(EINVAL);
-    
-    AVHWFramesContext* frames_ctx =
-        (AVHWFramesContext*)outlink->hw_frames_ctx->data;
-    AVCUDADeviceContext* device_hwctx = frames_ctx->device_ctx->hwctx;
-    if (!device_hwctx)
-        return AVERROR(EINVAL);
-
-    AVFrame* out = NULL;
-    CUcontext dummy;
-    int ret = 0;
-
-    out = av_frame_alloc();
-    if (!out) {
-        ret = AVERROR(ENOMEM);
-        goto fail;
-    }
-
-    ret = CHECK_CU(device_hwctx->internal->cuda_dl->cuCtxPushCurrent(
-        device_hwctx->cuda_ctx));
-    if (ret < 0)
-        goto fail;
-
-    ret = nppsharpen_sharpen(ctx, s->own_frame, in);
-    if (ret < 0)
-        goto pop_ctx;
-
-    ret = av_hwframe_get_buffer(s->own_frame->hw_frames_ctx, s->tmp_frame, 0);
-    if (ret < 0)
-        goto pop_ctx;
-
-    av_frame_move_ref(out, s->own_frame);
-    av_frame_move_ref(s->own_frame, s->tmp_frame);
-
-    ret = av_frame_copy_props(out, in);
-    if (ret < 0)
-        goto pop_ctx;
-
-    av_frame_free(&in);
-
-pop_ctx:
-    CHECK_CU(device_hwctx->internal->cuda_dl->cuCtxPopCurrent(&dummy));
-    if (!ret)
-        return ff_filter_frame(outlink, out);
-fail:
-    av_frame_free(&in);
-    av_frame_free(&out);
-    return ret;
-}
-#endif
-
-static const AVFilterPad remap_npp_inputs[] = {
+static const AVFilterPad remap_cuda_inputs[] = {
     {
         .name         = "top",
         .type         = AVMEDIA_TYPE_VIDEO,
@@ -647,28 +512,28 @@ static const AVFilterPad remap_npp_inputs[] = {
     },
 };
 
-static const AVFilterPad remap_npp_outputs[] = {
+static const AVFilterPad remap_cuda_outputs[] = {
     {
         .name          = "default",
         .type          = AVMEDIA_TYPE_VIDEO,
-        .config_props  = config_output, //remap_npp_config_props,
+        .config_props  = config_output,
     },
 };
 
-const AVFilter ff_vf_remap_npp = {
-    .name          = "remap_npp",
-    .description   = NULL_IF_CONFIG_SMALL("vstack and remap pixels using NPP."),
+const AVFilter ff_vf_remap_cuda = {
+    .name          = "remap_cuda",
+    .description   = NULL_IF_CONFIG_SMALL("vstack and remap pixels using CUDA."),
 
-    .init          = &remap_npp_init,
-    .uninit        = &remap_npp_uninit,
-    .activate      = &remap_npp_activate,
-    .preinit       = remap_npp_framesync_preinit,
+    .init          = &remap_cuda_init,
+    .uninit        = &remap_cuda_uninit,
+    .activate      = &remap_cuda_activate,
+    .preinit       = remap_cuda_framesync_preinit,
 
-    .priv_size     = sizeof(RemapNPPContext),
-    .priv_class    = &remap_npp_class,
+    .priv_size     = sizeof(RemapCUDAContext),
+    .priv_class    = &remap_cuda_class,
 
-    FILTER_INPUTS(remap_npp_inputs),
-    FILTER_OUTPUTS(remap_npp_outputs),
+    FILTER_INPUTS(remap_cuda_inputs),
+    FILTER_OUTPUTS(remap_cuda_outputs),
     FILTER_SINGLE_PIXFMT(AV_PIX_FMT_CUDA),
 
     .flags_internal  = FF_FILTER_FLAG_HWFRAME_AWARE,
