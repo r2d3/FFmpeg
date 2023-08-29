@@ -19,17 +19,17 @@ __global__ void Remap_Cuda(
     if (x < 0 || x >= map_w || y < 0 || y >= map_h)
         return;
         
-    int src_x = xmap[x + y * xmap_linesize/2]%(top_w);
-    int src_y = ymap[x + y * ymap_linesize/2]%(2*top_h);
+    int src_x = xmap[x + y * xmap_linesize/2];
+    int src_y = ymap[x + y * ymap_linesize/2];
 
     unsigned char v;
 
     if (src_y >= 2*top_h || src_x >= top_w)
         v = fill_color;
-    else if (src_y >= top_h) // source in top
-        v = top[src_x + (src_y - top_h) * top_linesize];
+    else if (src_y < top_h) // source in top
+        v = top[src_x + src_y * top_linesize];
     else
-        v = bottom[src_x + src_y * bottom_linesize];
+        v = bottom[src_x + (src_y - top_h) * bottom_linesize];
         
     out[x + y * out_linesize] = v;
 }
