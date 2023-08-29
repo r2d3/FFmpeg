@@ -49,23 +49,22 @@ static const enum AVPixelFormat supported_formats[] = {
 };
 
 static const enum AVPixelFormat supported_map_formats[] = {
-    AV_PIX_FMT_YUV444P16LE,
     AV_PIX_FMT_GRAY16LE,
     AV_PIX_FMT_NONE
 };
 
 typedef struct RemapCUDAContext {
     const AVClass* class;
-    
+
     enum AVPixelFormat in_format_top;
     enum AVPixelFormat in_format_bottom;
-    
+
     AVCUDADeviceContext *hwctx;
 
     CUmodule    cu_module;
     CUfunction  cu_func;
     CUstream    cu_stream;
-    
+
     FFFrameSync fs;
 } RemapCUDAContext;
 
@@ -121,11 +120,10 @@ static int remap_cuda_call_kernel(
         0, ctx->cu_stream, kernel_args, NULL));
 }
 
-
 static int remap_cuda(FFFrameSync *fs)
 {
     int i, ret;
-    
+
     AVFilterContext *avctx = fs->parent;
     RemapCUDAContext *ctx = avctx->priv;
     CudaFunctions *cu = ctx->hwctx->internal->cuda_dl;
@@ -138,7 +136,7 @@ static int remap_cuda(FFFrameSync *fs)
         RGB_TO_U_BT709(0, 0, 0, 0),
         RGB_TO_V_BT709(0, 0, 0, 0)
     };
-    
+
     av_log(avctx, AV_LOG_DEBUG, "remap_cuda: %d %d\n", outlink->w, outlink->h);
 
     // read top and bottom frames from inputs
@@ -151,10 +149,10 @@ static int remap_cuda(FFFrameSync *fs)
     ret = ff_framesync_get_frame(fs, 3, &input_ymap, 0);
     if (ret < 0)
         return ret;
-    
+
     if (!input_top || !input_bottom || !input_xmap || !input_ymap)
         return AVERROR_BUG;
-    
+
     av_log(avctx, AV_LOG_DEBUG, "Top: %d %d %d %d %d\n",
            input_top->width, input_top->height, input_top->linesize[0], input_top->linesize[1],
            input_top->linesize[2]);
@@ -173,11 +171,11 @@ static int remap_cuda(FFFrameSync *fs)
         ret = AVERROR(ENOMEM);
         goto fail;
     }
-    
+
     ret = CHECK_CU(cu->cuCtxPushCurrent(ctx->hwctx->cuda_ctx));
     if (ret < 0)
         return ret;
-    
+
     // Do the processing
     for (i = 0; i < 3; i++)
     {
@@ -223,7 +221,7 @@ static void remap_cuda_uninit(AVFilterContext* avctx)
     av_log(avctx, AV_LOG_DEBUG, "remap_cuda_uninit\n");
 
     ff_framesync_uninit(&ctx->fs);
-    
+
     if (ctx->hwctx && ctx->cu_module) {
         CudaFunctions *cu = ctx->hwctx->internal->cuda_dl;
         CUcontext dummy;
@@ -265,7 +263,7 @@ static int config_props(AVFilterLink *inlink)
         av_log(ctx, AV_LOG_ERROR, "Input frame is not CUDA.\n");
         return AVERROR(EINVAL);
     }
-    
+
     s->hwctx = device_hwctx;
     s->cu_stream = s->hwctx->stream;
 
@@ -282,7 +280,7 @@ static int config_map(AVFilterLink *inlink)
     AVFilterContext *ctx = inlink->dst;
 
     av_log(ctx, AV_LOG_DEBUG, "config_map\n");
-    
+
     if (!inlink->hw_frames_ctx) {
         av_log(ctx, AV_LOG_ERROR, "remap_cuda requires a "
                "hardware frames context on the input.\n");
@@ -301,7 +299,7 @@ static int config_map(AVFilterLink *inlink)
         av_log(ctx, AV_LOG_ERROR, "Input map is not CUDA.\n");
         return AVERROR(EINVAL);
     }
-    
+
     return 0;
 }
 
@@ -326,7 +324,7 @@ static int config_output(AVFilterLink* outlink)
     CudaFunctions *cu;
 
     av_log(avctx, AV_LOG_DEBUG, "config_output\n");
-    
+
     {
         if (!inlink_top || !inlink_top->hw_frames_ctx || !inlink_top->hw_frames_ctx->data)
             return AVERROR(EINVAL);
@@ -439,7 +437,7 @@ static int config_output(AVFilterLink* outlink)
                av_get_pix_fmt_name(ctx->in_format_top), av_get_pix_fmt_name(ctx->in_format_bottom));
         return AVERROR(EINVAL);
     }
-    
+
     // load functions
 
     {
