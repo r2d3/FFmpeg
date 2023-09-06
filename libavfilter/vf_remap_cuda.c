@@ -139,8 +139,10 @@ static int remap_cuda(FFFrameSync *fs)
 
     av_log(avctx, AV_LOG_DEBUG, "remap_cuda: %d %d\n", outlink->w, outlink->h);
 
-    // read top and bottom frames from inputs
-    ret = ff_framesync_dualinput_get(fs, &input_top, &input_bottom);
+    ret = ff_framesync_get_frame(fs, 0, &input_top, 0);
+    if (ret < 0)
+        return ret;
+    ret = ff_framesync_get_frame(fs, 1, &input_bottom, 0);
     if (ret < 0)
         return ret;
     ret = ff_framesync_get_frame(fs, 2, &input_xmap, 0);
